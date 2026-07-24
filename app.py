@@ -1,6 +1,6 @@
 import streamlit as st
-import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
+from supabase import create_client
 from google import genai
 from google.genai import types
 
@@ -24,64 +24,56 @@ def sanitize_text(text: str) -> str:
     return text
 
 # ---------------------------------------------------------------
-# Database setup
+# Database setup (Supabase - persists across redeploys)
 # ---------------------------------------------------------------
-DB_PATH = "chats.db"
+@st.cache_resource
+def get_supabase():
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS chats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (chat_id) REFERENCES chats (id)
-        )
-    """)
-    conn.commit()
-    return conn
-
-conn = get_conn()
+sb = get_supabase()
 
 def create_chat(title="New Chat"):
-    now = datetime.now().isoformat()
-    cur = conn.execute("INSERT INTO chats (title, created_at) VALUES (?, ?)", (title, now))
-    conn.commit()
-    return cur.lastrowid
+    now = datetime.now(timezone.utc).isoformat()
+    result = sb.table("chats").insert({"title": title, "created_at": now, "context": ""}).execute()
+    return result.data[0]["id"]
 
 def get_all_chats():
-    return conn.execute("SELECT id, title, created_at FROM chats ORDER BY created_at DESC").fetchall()
+    result = sb.table("chats").select("id, title, created_at").order("created_at", desc=True).execute()
+    return [(row["id"], row["title"], row["created_at"]) for row in result.data]
+
+def get_chat_context(chat_id):
+    result = sb.table("chats").select("context").eq("id", chat_id).execute()
+    if result.data:
+        return result.data[0].get("context") or ""
+    return ""
+
+def update_chat_context(chat_id, context):
+    sb.table("chats").update({"context": context}).eq("id", chat_id).execute()
 
 def get_messages(chat_id):
-    return conn.execute(
-        "SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id ASC", (chat_id,)
-    ).fetchall()
+    result = (
+        sb.table("messages")
+        .select("role, content")
+        .eq("chat_id", chat_id)
+        .order("id", desc=False)
+        .execute()
+    )
+    return [(row["role"], row["content"]) for row in result.data]
 
 def add_message(chat_id, role, content):
-    now = datetime.now().isoformat()
-    conn.execute(
-        "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-        (chat_id, role, content, now),
-    )
-    conn.commit()
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("messages").insert(
+        {"chat_id": chat_id, "role": role, "content": content, "created_at": now}
+    ).execute()
 
 def update_chat_title(chat_id, title):
-    conn.execute("UPDATE chats SET title = ? WHERE id = ?", (title, chat_id))
-    conn.commit()
+    sb.table("chats").update({"title": title}).eq("id", chat_id).execute()
 
 def delete_chat(chat_id):
-    conn.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
-    conn.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
-    conn.commit()
+    sb.table("messages").delete().eq("chat_id", chat_id).execute()
+    sb.table("chats").delete().eq("id", chat_id).execute()
 
 # ---------------------------------------------------------------
 # Page config
@@ -131,7 +123,8 @@ if "active_chat_id" not in st.session_state:
 
 with st.sidebar:
     st.header("Configuration")
-    api_key = st.text_input("Enter your Gemini API Key", type="password", value="")
+    default_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
+    api_key = st.text_input("Enter your Gemini API Key", type="password", value=default_key)
     st.markdown("---")
 
     st.header("Chats")
@@ -175,6 +168,14 @@ else:
     client = genai.Client(api_key=api_key)
     chat_id = st.session_state.active_chat_id
 
+    with st.expander("📋 Project Context for this chat", expanded=False):
+        st.caption("Set background once (e.g. 'ServiceNow ITSM, focused on Incident and Change modules'). It's automatically included in every prompt for this chat.")
+        current_context = get_chat_context(chat_id)
+        new_context = st.text_area("Context", value=current_context, label_visibility="collapsed", height=100, key=f"context_{chat_id}")
+        if st.button("Save Context", key=f"save_context_{chat_id}"):
+            update_chat_context(chat_id, new_context)
+            st.success("Context saved.")
+
     history = get_messages(chat_id)
     for role, content in history:
         with st.chat_message(role):
@@ -206,11 +207,16 @@ else:
                         types.Content(role=api_role, parts=[types.Part(text=sanitize_text(content))])
                     )
 
+                chat_context = get_chat_context(chat_id)
+                system_prompt = QA_SYSTEM_PROMPT
+                if chat_context.strip():
+                    system_prompt += f"\n\nProject-specific context for this conversation:\n{chat_context.strip()}"
+
                 response = client.models.generate_content(
                     model="gemini-flash-latest",
                     contents=contents,
                     config=types.GenerateContentConfig(
-                        system_instruction=QA_SYSTEM_PROMPT,
+                        system_instruction=system_prompt,
                         temperature=0.3,
                     ),
                 )
