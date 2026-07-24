@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 from datetime import datetime, timezone
 from supabase import create_client
@@ -24,19 +25,60 @@ def sanitize_text(text: str) -> str:
     return text
 
 # ---------------------------------------------------------------
-# Database setup (Supabase - persists across redeploys)
+# Supabase client — one per browser session (NOT globally cached),
+# so each logged-in user's auth session stays isolated.
 # ---------------------------------------------------------------
-@st.cache_resource
 def get_supabase():
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
-    return create_client(url, key)
+    if "sb_client" not in st.session_state:
+        url = None
+        key = None
+        if hasattr(st, "secrets"):
+            url = st.secrets.get("SUPABASE_URL")
+            key = st.secrets.get("SUPABASE_KEY")
+        url = url or os.environ.get("SUPABASE_URL")
+        key = key or os.environ.get("SUPABASE_KEY")
+        if not url or not key:
+            st.error(
+                "Supabase credentials are not configured. "
+                "Please set SUPABASE_URL and SUPABASE_KEY in Streamlit secrets or environment variables."
+            )
+            st.stop()
+        st.session_state.sb_client = create_client(url, key)
+    return st.session_state.sb_client
 
 sb = get_supabase()
 
-def create_chat(title="New Chat"):
+# ---------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------
+def sign_up(email, password):
+    return sb.auth.sign_up({"email": email, "password": password})
+
+def sign_in(email, password):
+    return sb.auth.sign_in_with_password({"email": email, "password": password})
+
+def sign_out():
+    sb.auth.sign_out()
+    for key in ["user", "active_chat_id", "sb_client"]:
+        st.session_state.pop(key, None)
+
+def get_profile(user_id):
+    result = sb.table("profiles").select("gemini_api_key").eq("id", user_id).execute()
+    if result.data:
+        return result.data[0].get("gemini_api_key") or ""
+    return None  # profile row doesn't exist yet
+
+def save_profile_key(user_id, gemini_key):
+    sb.table("profiles").upsert({"id": user_id, "gemini_api_key": gemini_key}).execute()
+
+# ---------------------------------------------------------------
+# Database helpers (all scoped to the logged-in user via RLS)
+# ---------------------------------------------------------------
+def create_chat(user_id, title="New Chat"):
     now = datetime.now(timezone.utc).isoformat()
-    result = sb.table("chats").insert({"title": title, "created_at": now, "context": ""}).execute()
+    result = sb.table("chats").insert(
+        {"title": title, "created_at": now, "context": "", "user_id": user_id}
+    ).execute()
     return result.data[0]["id"]
 
 def get_all_chats():
@@ -116,6 +158,67 @@ Format each testcase with a short, punchy sentence detailing the action and expe
 """
 
 # ---------------------------------------------------------------
+# Auth gate — must log in before anything else loads
+# ---------------------------------------------------------------
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+if st.session_state.user is None:
+    st.subheader("🔐 Log in or sign up to continue")
+    tab_login, tab_signup = st.tabs(["Log In", "Sign Up"])
+
+    with tab_login:
+        with st.form("login_form"):
+            login_email = st.text_input("Email", key="login_email")
+            login_password = st.text_input("Password", type="password", key="login_password")
+            submitted = st.form_submit_button("Log In")
+            if submitted:
+                try:
+                    res = sign_in(login_email, login_password)
+                    st.session_state.user = res.user
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Login failed: {e}")
+
+    with tab_signup:
+        with st.form("signup_form"):
+            signup_email = st.text_input("Email", key="signup_email")
+            signup_password = st.text_input("Password (min 6 characters)", type="password", key="signup_password")
+            submitted = st.form_submit_button("Sign Up")
+            if submitted:
+                try:
+                    res = sign_up(signup_email, signup_password)
+                    if res.user:
+                        st.success("Account created! Check your email if confirmation is required, then log in.")
+                    else:
+                        st.error("Sign up failed. Try a different email.")
+                except Exception as e:
+                    st.error(f"Sign up failed: {e}")
+
+    st.stop()
+
+# ---------------------------------------------------------------
+# Logged in — check/collect their Gemini key once
+# ---------------------------------------------------------------
+user = st.session_state.user
+saved_key = get_profile(user.id)
+
+if saved_key is None:
+    # Profile row doesn't exist yet - first login, ask for their key
+    st.subheader("👋 One-time setup")
+    st.markdown("Enter your Gemini API key once — it'll be saved to your account so you won't need to enter it again.")
+    st.markdown("Get a free key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey)")
+    with st.form("first_key_form"):
+        first_key = st.text_input("Gemini API Key", type="password")
+        submitted = st.form_submit_button("Save & Continue")
+        if submitted and first_key:
+            save_profile_key(user.id, first_key)
+            st.rerun()
+    st.stop()
+
+api_key = saved_key
+
+# ---------------------------------------------------------------
 # Sidebar: API key + chat management
 # ---------------------------------------------------------------
 if "active_chat_id" not in st.session_state:
@@ -129,7 +232,7 @@ with st.sidebar:
 
     st.header("Chats")
     if st.button("➕ Start New Chat", use_container_width=True):
-        new_id = create_chat("New Chat")
+        new_id = create_chat(user.id, "New Chat")
         st.session_state.active_chat_id = new_id
         st.rerun()
 
